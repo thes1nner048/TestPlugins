@@ -1,91 +1,169 @@
-import com.android.build.gradle.BaseExtension
-import com.lagradost.cloudstream3.gradle.CloudstreamExtension
-import org.jetbrains.kotlin.gradle.dsl.JvmTarget
-import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
+package com.sportsbite
 
-buildscript {
-    repositories {
-        google()
-        mavenCentral()
-        // Shitpack repo which contains our tools and dependencies
-        maven("https://jitpack.io")
+import com.fasterxml.jackson.annotation.JsonProperty
+import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.utils.AppUtils.parseJson
+import com.lagradost.cloudstream3.utils.AppUtils.toJson
+
+class SportsBiteProvider : MainAPI() {
+    override var mainUrl = "https://sportsbite.org"
+    override var name = "SportsBite"
+    override var lang = "en"
+    override val hasMainPage = true
+    override val supportedTypes = setOf(TvType.Live)
+
+    // data = "status:<değer>" veya "sport:<değer>"
+    override val mainPage = mainPageOf(
+        "status:live" to "🔴 Canlı",
+        "status:upcoming" to "Yaklaşan",
+        "sport:football" to "Futbol",
+        "sport:basketball" to "Basketbol",
+        "sport:hockey" to "Hokey",
+        "sport:american-football" to "Amerikan Futbolu",
+        "sport:fighting" to "Dövüş"
+    )
+
+    private suspend fun fetchPage(page: Int): Schedule =
+        app.get("$mainUrl/api/schedule?page=$page").parsed<Schedule>()
+
+    private suspend fun findEvent(id: String): Event? {
+        var page = 1
+        while (true) {
+            val res = fetchPage(page)
+            res.events.firstOrNull { it.id == id }?.let { return it }
+            if (page >= (res.pagination?.pages ?: 1)) return null
+            page++
+        }
     }
 
-    dependencies {
-        classpath("com.android.tools.build:gradle:8.7.3")
-        // Cloudstream gradle plugin which makes everything work and builds plugins
-        classpath("com.github.recloudstream:gradle:-SNAPSHOT")
-        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.1.0")
-    }
-}
-
-allprojects {
-    repositories {
-        google()
-        mavenCentral()
-        maven("https://jitpack.io")
-    }
-}
-
-fun Project.cloudstream(configuration: CloudstreamExtension.() -> Unit) = extensions.getByName<CloudstreamExtension>("cloudstream").configuration()
-
-fun Project.android(configuration: BaseExtension.() -> Unit) = extensions.getByName<BaseExtension>("android").configuration()
-
-subprojects {
-    apply(plugin = "com.android.library")
-    apply(plugin = "kotlin-android")
-    apply(plugin = "com.lagradost.cloudstream3.gradle")
-
-    cloudstream {
-        // when running through github workflow, GITHUB_REPOSITORY should contain current repository name
-        setRepo(System.getenv("GITHUB_REPOSITORY") ?: "user/repo")
-    }
-
-    android {
-        namespace = "com.example"
-
-        defaultConfig {
-            minSdk = 21
-            compileSdkVersion(35)
-            targetSdk = 35
+    private fun Event.toSearchResponse(): SearchResponse =
+        newLiveSearchResponse(title, this.toJson(), TvType.Live) {
+            posterUrl = teams?.home?.logo ?: tournament?.logo
         }
 
-        compileOptions {
-            sourceCompatibility = JavaVersion.VERSION_1_8
-            targetCompatibility = JavaVersion.VERSION_1_8
-        }
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val res = fetchPage(page)
+        val (key, value) = request.data.split(":", limit = 2)
+        val items = res.events
+            .filter { if (key == "status") it.status == value else it.sport == value }
+            .map { it.toSearchResponse() }
+        return newHomePageResponse(
+            request.name, items, hasNext = page < (res.pagination?.pages ?: 1)
+        )
+    }
 
-        tasks.withType<KotlinJvmCompile> {
-            compilerOptions {
-                jvmTarget.set(JvmTarget.JVM_1_8) // Required
-                freeCompilerArgs.addAll(
-                    "-Xno-call-assertions",
-                    "-Xno-param-assertions",
-                    "-Xno-receiver-assertions"
-                )
+    override suspend fun search(query: String): List<SearchResponse> {
+        val out = mutableListOf<SearchResponse>()
+        var page = 1
+        while (true) {
+            val res = fetchPage(page)
+            res.events.filter { it.title.contains(query, ignoreCase = true) }
+                .forEach { out.add(it.toSearchResponse()) }
+            if (page >= (res.pagination?.pages ?: 1)) break
+            page++
+        }
+        return out
+    }
+
+    override suspend fun load(url: String): LoadResponse {
+        val e = parseJson<Event>(url)
+        return newLiveStreamLoadResponse(e.title, e.watchUrl ?: mainUrl, url) {
+            posterUrl = e.teams?.home?.logo ?: e.tournament?.logo
+            plot = "${e.tournament?.name.orEmpty()}\n${e.date} ${e.kickoffTime} UTC • ${e.status}"
+        }
+    }
+
+    override suspend fun loadLinks(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val stored = parseJson<Event>(data)
+        // Yayın linkleri sonradan eklenebildiği için güncel veriyi tekrar çek
+        val event = findEvent(stored.id) ?: stored
+        var found = false
+        event.streams.orEmpty().forEach { s ->
+            val link = s.embedUrl ?: return@forEach
+            loadExtractor(link, "$mainUrl/", subtitleCallback) {
+                found = true
+                callback(it)
             }
         }
-    }
-
-    dependencies {
-        val cloudstream by configurations
-        val implementation by configurations
-
-        // Stubs for all cloudstream classes
-        cloudstream("com.lagradost:cloudstream3:pre-release")
-
-        // These dependencies can include any of those which are added by the app,
-        // but you don't need to include any of them if you don't need them.
-        // https://github.com/recloudstream/cloudstream/blob/master/app/build.gradle.kts
-        implementation(kotlin("stdlib")) // Adds Standard Kotlin Features
-        implementation("com.github.Blatzar:NiceHttp:0.4.11") // HTTP Lib
-        implementation("org.jsoup:jsoup:1.18.3") // HTML Parser
-        // IMPORTANT: Do not bump Jackson above 2.13.1, as newer versions will
-        // break compatibility on older Android devices.
-        implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.13.1") // JSON Parser
+        return found
     }
 }
 
-task<Delete>("clean") {
-    delete(rootProject.layout.buildDirectory)
+class SportsBiteExtractor : ExtractorApi() {
+    override val name = "SportsBite"
+    override val mainUrl = "https://embed.sportsbite.org"
+    override val requiresReferer = true
+
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val html = app.get(url, referer = referer ?: "https://sportsbite.org/")
+            .text.replace("\\/", "/")
+        Regex("""https?:[^"'\s<>\\]+?\.m3u8[^"'\s<>\\]*""")
+            .findAll(html).map { it.value }.distinct()
+            .forEach { m3u8 ->
+                callback(
+                    newExtractorLink(name, name, m3u8, ExtractorLinkType.M3U8) {
+                        this.referer = url
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
+            }
+    }
 }
+
+// ---- API modelleri ----
+data class Schedule(
+    @JsonProperty("pagination") val pagination: Pagination? = null,
+    @JsonProperty("events") val events: List<Event> = emptyList()
+)
+
+data class Pagination(
+    @JsonProperty("page") val page: Int? = null,
+    @JsonProperty("pages") val pages: Int? = null,
+    @JsonProperty("total") val total: Int? = null
+)
+
+data class Event(
+    @JsonProperty("id") val id: String = "",
+    @JsonProperty("title") val title: String = "",
+    @JsonProperty("sport") val sport: String? = null,
+    @JsonProperty("status") val status: String? = null,
+    @JsonProperty("date") val date: String? = null,
+    @JsonProperty("kickoff_time") val kickoffTime: String? = null,
+    @JsonProperty("watch_url") val watchUrl: String? = null,
+    @JsonProperty("tournament") val tournament: Tournament? = null,
+    @JsonProperty("teams") val teams: Teams? = null,
+    @JsonProperty("streams") val streams: List<Stream>? = null
+)
+
+data class Tournament(
+    @JsonProperty("name") val name: String? = null,
+    @JsonProperty("logo") val logo: String? = null
+)
+
+data class Teams(
+    @JsonProperty("home") val home: Team? = null,
+    @JsonProperty("away") val away: Team? = null
+)
+
+data class Team(
+    @JsonProperty("name") val name: String? = null,
+    @JsonProperty("logo") val logo: String? = null
+)
+
+data class Stream(
+    @JsonProperty("name") val name: String? = null,
+    @JsonProperty("embed_url") val embedUrl: String? = null,
+    @JsonProperty("quality") val quality: String? = null,
+    @JsonProperty("language") val language: String? = null
+)
